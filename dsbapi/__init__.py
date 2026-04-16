@@ -32,14 +32,13 @@ __version_info__ = ("0", "0", "14")
 __version__ = ".".join(__version_info__)
 
 DEFAULT_TABLEMAPPER = [
-    "type",
     "class",
     "lesson",
+    "teacher",
     "subject",
     "room",
-    "new_subject",
-    "new_teacher",
-    "teacher",
+    "type",
+    "text",
 ]
 
 
@@ -266,4 +265,5 @@ class DSBApi:
 
 
 __all__ = ["DSBApi", "__version__", "__version_info__"]
+
 
