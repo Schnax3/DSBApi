@@ -1,6 +1,4 @@
-requests
-beautifulsoup4
-datetime
+﻿beautifulsoup4
+pillow
 pytesseract
 requests
-PIL

@@ -1,7 +1,11 @@
+﻿from pathlib import Path
+
 import setuptools
 
-with open("README.md", "r") as fh:
-    long_description = fh.read()
+
+BASE_DIR = Path(__file__).resolve().parent
+long_description = (BASE_DIR / "README.md").read_text(encoding="utf-8")
+
 
 setuptools.setup(
     name="dsbapipy",
@@ -18,5 +22,11 @@ setuptools.setup(
         "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
         "Operating System :: OS Independent",
     ],
-    python_requires='>=3.5',
+    python_requires=">=3.8",
+    install_requires=[
+        "beautifulsoup4",
+        "pillow",
+        "pytesseract",
+        "requests",
+    ],
 )
