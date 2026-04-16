@@ -1,65 +1,105 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 DSBApi
 An API for the DSBMobile substitution plan solution, which many schools use.
 """
-__version_info__ = ('0', '0', '14')
-__version__ = '.'.join(__version_info__)
 
-import bs4
-import json
-import requests
+from __future__ import annotations
+
+import base64
 import datetime
 import gzip
+import io
+import json
 import uuid
-import base64
+
+import bs4
+import requests
 
 try:
     from PIL import Image
-except:
-    import Image
+except ImportError:  # pragma: no cover - Pillow is the supported dependency
+    import Image  # type: ignore[no-redef]
+
+try:
+    from pytesseract import TesseractError
+except ImportError:  # pragma: no cover - older pytesseract exports may differ
+    TesseractError = RuntimeError
+
 import pytesseract
-import requests
+
+__version_info__ = ("0", "0", "14")
+__version__ = ".".join(__version_info__)
+
+DEFAULT_TABLEMAPPER = [
+    "type",
+    "class",
+    "lesson",
+    "subject",
+    "room",
+    "new_subject",
+    "new_teacher",
+    "teacher",
+]
+
 
 class DSBApi:
-    def __init__(self, username, password, tablemapper=['type','class','lesson','subject','room','new_subject','new_teacher','teacher']):
+    def __init__(self, username, password, tablemapper=None, timeout=15):
         """
-        Class constructor for class DSBApi
+        Class constructor for class DSBApi.
+
         @param username: string, the username of the DSBMobile account
         @param password: string, the password of the DSBMobile account
-        @param tablemapper: list, the field mapping of the DSBMobile tables (default: ['type','class','lesson','subject','room','new_subject','new_teacher','teacher'])
-        @return: class
+        @param tablemapper: list, the field mapping of the DSBMobile tables
+        @param timeout: int/float, request timeout in seconds
         @raise TypeError: If the attribute tablemapper is not of type list
         """
         self.DATA_URL = "https://app.dsbcontrol.de/JsonHandler.ashx/GetData"
         self.username = username
         self.password = password
+        self.timeout = timeout
+        self.session = requests.Session()
+
+        if tablemapper is None:
+            tablemapper = list(DEFAULT_TABLEMAPPER)
         if not isinstance(tablemapper, list):
-            raise TypeError('Attribute tablemapper is not of type list!')
+            raise TypeError("Attribute tablemapper is not of type list!")
         self.tablemapper = tablemapper
-        
-        # loop over tablemapper array and identify the keyword "class". The "class" will have a special operation in split up the datasets
-        self.class_index = None
-        i = 0
-        while i < len(self.tablemapper):
-            if self.tablemapper[i] == 'class':
-                self.class_index = i
-                break
-            i += 1
-       
+        self.class_index = self._find_class_index()
+
+    def _find_class_index(self):
+        for index, value in enumerate(self.tablemapper):
+            if value == "class":
+                return index
+        return None
+
+    def _request_json(self, url, **kwargs):
+        response = self.session.request(url=url, timeout=self.timeout, **kwargs)
+        response.raise_for_status()
+        return response.json()
+
+    def _request_text(self, url):
+        response = self.session.get(url, timeout=self.timeout)
+        response.raise_for_status()
+        if not response.encoding or response.encoding.lower() == "iso-8859-1":
+            response.encoding = response.apparent_encoding or "utf-8"
+        return response.text
+
+    def _request_bytes(self, url):
+        response = self.session.get(url, timeout=self.timeout)
+        response.raise_for_status()
+        return response.content
 
     def fetch_entries(self, images=True):
         """
-        Fetch all the DSBMobile entries
-        @return: list, containing lists of DSBMobile entries from the tables or only the entries if just one table was received (default: empty list)
-        @rais Exception: If the request to DSBMonile failed
-        """
-        # Iso format is for example 2019-10-29T19:20:31.875466
-        current_time = datetime.datetime.now().isoformat()
-        # Cut off last 3 digits and add 'Z' to get correct format
-        current_time = current_time[:-3] + "Z"
+        Fetch all DSBMobile entries.
 
-        # Parameters required for the server to accept our data request
+        @return: list, containing lists of DSBMobile entries from the tables or
+                 only the entries if just one table was received
+        @raise Exception: If the request to DSBMobile failed
+        """
+        current_time = datetime.datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+
         params = {
             "UserId": self.username,
             "UserPw": self.password,
@@ -70,121 +110,160 @@ class DSBApi:
             "Device": "SM-G930F",
             "BundleId": "de.heinekingmedia.dsbmobile",
             "Date": current_time,
-            "LastUpdate": current_time
+            "LastUpdate": current_time,
         }
-        # Convert params into the right format
-        params_bytestring = json.dumps(params, separators=(',', ':')).encode("UTF-8")
-        params_compressed = base64.b64encode(gzip.compress(params_bytestring)).decode("UTF-8")
 
-        # Send the request
+        params_bytestring = json.dumps(params, separators=(",", ":")).encode("utf-8")
+        params_compressed = base64.b64encode(gzip.compress(params_bytestring)).decode("utf-8")
         json_data = {"req": {"Data": params_compressed, "DataType": 1}}
-        timetable_data = requests.post(self.DATA_URL, json = json_data)
+        payload = self._request_json(self.DATA_URL, method="post", json=json_data)
 
-        # Decompress response
-        data_compressed = json.loads(timetable_data.content)["d"]
-        data = json.loads(gzip.decompress(base64.b64decode(data_compressed)))
+        try:
+            data_compressed = payload["d"]
+            data = json.loads(gzip.decompress(base64.b64decode(data_compressed)))
+        except (KeyError, ValueError, OSError, TypeError) as exc:
+            raise Exception("Received invalid response payload from DSBMobile") from exc
 
-        # validate response before proceed
-        if data['Resultcode'] != 0:
-            raise Exception(data['ResultStatusInfo'])
-        
-        # Find the timetable page, and extract the timetable URL from it
-        final = []
-        for page in data["ResultMenuItems"][0]["Childs"]:
-                for child in page["Root"]["Childs"]:
-                        if isinstance(child["Childs"], list):
-                            for sub_child in child["Childs"]:
-                                final.append(sub_child["Detail"])
-                        else:
-                            final.append(child["Childs"]["Detail"])
-        if not final:
+        if data.get("Resultcode") != 0:
+            raise Exception(data.get("ResultStatusInfo", "Unknown DSBMobile error"))
+
+        detail_urls = self._extract_detail_urls(data)
+        if not detail_urls:
             raise Exception("Timetable data could not be found")
+
         output = []
-        for entry in final:
+        for entry in detail_urls:
             if entry.endswith(".htm") and not entry.endswith(".html") and not entry.endswith("news.htm"):
                 output.append(self.fetch_timetable(entry))
-            elif entry.endswith(".jpg") and images == True:
-                output.append(self.fetch_img(entry))
-
-        final = []
-        for entry in output:
-            if entry is not None:
-                final.append(entry)
-
-        output = final
+            elif entry.endswith(".jpg") and images:
+                image_text = self.fetch_img(entry)
+                if image_text is not None:
+                    output.append(image_text)
 
         if len(output) == 1:
             return output[0]
-        else:
-            return output
+        return output
 
+    def _extract_detail_urls(self, data):
+        detail_urls = []
+        menu_items = data.get("ResultMenuItems") or []
+        if not menu_items:
+            return detail_urls
+
+        for page in menu_items[0].get("Childs", []):
+            root = page.get("Root") or {}
+            for child in root.get("Childs", []):
+                child_nodes = child.get("Childs")
+                if isinstance(child_nodes, list):
+                    for sub_child in child_nodes:
+                        detail = sub_child.get("Detail")
+                        if detail:
+                            detail_urls.append(detail)
+                elif isinstance(child_nodes, dict):
+                    detail = child_nodes.get("Detail")
+                    if detail:
+                        detail_urls.append(detail)
+        return detail_urls
 
     def fetch_img(self, imgurl):
         """
-        Extract data from the image
+        Extract OCR text from an image.
+
         @param imgurl: string, the URL to the image
-        @return: list, list of dicts
-        @todo: Future use - implement OCR
-        @raise Exception: If the function will be crawled, because the funbtion is not implemented yet
+        @return: string or None
         """
-
         try:
-            img = Image.open(io.BytesIO(requests.get(imgurl)))
-        except:
-            return  #haha this is quality coding surplus
-
-        string = ""
-
-        try:
-            return  pytesseract.image_to_string(img)
-        except TesseractError:
-            raise Exception("You have to make the tesseract command accessible and work!")
+            image_bytes = self._request_bytes(imgurl)
+            img = Image.open(io.BytesIO(image_bytes))
+        except Exception:
             return None
+
+        try:
+            return pytesseract.image_to_string(img)
+        except TesseractError as exc:
+            raise Exception("You have to make the tesseract command accessible and work!") from exc
 
     def fetch_timetable(self, timetableurl):
         """
-        parse the timetableurl HTML page and return the parsed entries
+        Parse the timetable HTML page and return the parsed entries.
+
         @param timetableurl: string, the URL to the timetable in HTML format
         @return: list, list of dicts
         """
         results = []
-        sauce = requests.get(timetableurl).text
-        soupi = bs4.BeautifulSoup(sauce, "html.parser")
-        ind = -1
-        for soup in soupi.find_all('table', {'class': 'mon_list'}):
-            ind += 1
-            updates = [o.p.findAll('span')[-1].next_sibling.split("Stand: ")[1] for o in soupi.findAll('table', {'class': 'mon_head'})][ind]
-            titles = [o.text for o in soupi.findAll('div', {'class': 'mon_title'})][ind]
-            date = titles.split(" ")[0]
-            day = titles.split(" ")[1].split(", ")[0].replace(",", "")
-            entries = soup.find_all("tr")
-            entries.pop(0)
-            for entry in entries:
-                infos = entry.find_all("td")
+        soup = bs4.BeautifulSoup(self._request_text(timetableurl), "html.parser")
+        tables = soup.find_all("table", {"class": "mon_list"})
+        headers = soup.find_all("table", {"class": "mon_head"})
+        titles = [title.get_text(" ", strip=True) for title in soup.find_all("div", {"class": "mon_title"})]
+
+        for index, table in enumerate(tables):
+            updated = self._extract_updated(headers, index)
+            date, day = self._extract_title_parts(titles, index)
+            rows = table.find_all("tr")[1:]
+
+            for row in rows:
+                infos = row.find_all("td")
                 if len(infos) < 2:
                     continue
-                
-                # check if a "class" attribute is there, if yes, split the "class" value by "," to spread out the data rows for each school class
-                if self.class_index != None:
-                    class_array = infos[self.class_index].text.split(", ")
-                else:
-                    # define a dummy value if we don't have a class column (with keyword "class")
-                    class_array = [ '---' ]
-                for class_ in class_array:
-                    new_entry = dict()
-                    new_entry["date"] = date
-                    new_entry["day"]  = day
-                    new_entry["updated"] = updates
-                    i = 0
-                    while i < len(infos):
-                        if i < len(self.tablemapper):
-                            attribute = self.tablemapper[i]
+
+                class_values = self._extract_class_values(infos)
+                for class_value in class_values:
+                    new_entry = {
+                        "date": date,
+                        "day": day,
+                        "updated": updated,
+                    }
+                    for col_index, info in enumerate(infos):
+                        attribute = self.tablemapper[col_index] if col_index < len(self.tablemapper) else "col" + str(col_index)
+                        value = info.get_text(strip=True) or "---"
+                        if attribute == "class":
+                            new_entry[attribute] = class_value if value != "---" else "---"
                         else:
-                            attribute = 'col' + str(i)
-                        if attribute == 'class':
-                            new_entry[attribute] = class_ if infos[i].text != "\xa0" else "---"
-                        else:
-                            new_entry[attribute] = infos[i].text if infos[i].text != "\xa0" else "---"
-                        i += 1
+                            new_entry[attribute] = value
                     results.append(new_entry)
         return results
+
+    def _extract_updated(self, headers, index):
+        if index >= len(headers):
+            return "---"
+
+        spans = headers[index].find_all("span")
+        if not spans:
+            return "---"
+
+        sibling = spans[-1].next_sibling
+        if not isinstance(sibling, str):
+            return "---"
+
+        parts = sibling.split("Stand: ", 1)
+        if len(parts) == 2 and parts[1].strip():
+            return parts[1].strip()
+        return sibling.strip() or "---"
+
+    def _extract_title_parts(self, titles, index):
+        if index >= len(titles):
+            return "---", "---"
+
+        title = titles[index].strip()
+        if not title:
+            return "---", "---"
+
+        parts = title.split(" ", 1)
+        date = parts[0]
+        day_text = parts[1] if len(parts) > 1 else "---"
+        day = day_text.split(", ", 1)[0].replace(",", "").strip() or "---"
+        return date, day
+
+    def _extract_class_values(self, infos):
+        if self.class_index is None or self.class_index >= len(infos):
+            return ["---"]
+
+        raw_value = infos[self.class_index].get_text(strip=True)
+        if not raw_value:
+            return ["---"]
+
+        return [part.strip() for part in raw_value.split(",") if part.strip()] or ["---"]
+
+
+__all__ = ["DSBApi", "__version__", "__version_info__"]
+
